@@ -952,6 +952,9 @@ class MainWindow(QMainWindow):
         self.chk_autostart.toggled.connect(self._on_autostart_toggled)
         row.addWidget(self.chk_autostart)
         row.addStretch(1)
+        self.btn_reconfig = QPushButton("修改配置")
+        self.btn_reconfig.clicked.connect(self._show_reconfig_dialog)
+        row.addWidget(self.btn_reconfig)
         self.btn_update = QPushButton("更新客户端程序")
         self.btn_update.clicked.connect(self.download_client)
         row.addWidget(self.btn_update)
@@ -1205,6 +1208,7 @@ class MainWindow(QMainWindow):
     def download_client(self, autostart_after: bool = False):
         if self.downloader and self.downloader.isRunning():
             return
+        self.tabs.setCurrentIndex(0)  # 切到状态页让用户看到下载进度
         self.progress.setVisible(True)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -1247,6 +1251,71 @@ class MainWindow(QMainWindow):
             f"[GUI] 配置已保存: 客户端 {params['client_id']} -> {params['rpc_url']}"
         )
         self.start_client()
+
+    def _show_reconfig_dialog(self):
+        """弹出对话框, 重新粘贴启动命令修改配置"""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("修改配置")
+        dlg.setMinimumWidth(520)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 20, 20, 16)
+        tip = QLabel("粘贴新的客户端启动命令，保存后将停止当前客户端并用新配置重启：")
+        tip.setWordWrap(True)
+        tip.setObjectName("subTitleLabel")
+        lay.addWidget(tip)
+        edit = QPlainTextEdit()
+        # 预填当前配置对应的命令
+        c = self.cfg.client
+        if c.get("secret"):
+            parts = [f"frp-panel client -s {c['secret']} -i {c['client_id']}"]
+            if c.get("api_url"):
+                parts.append(f"--api-url {c['api_url']}")
+            parts.append(f"--rpc-url {c['rpc_url']}")
+            edit.setPlainText(" ".join(parts))
+        edit.setFixedHeight(100)
+        lay.addWidget(edit)
+        preview = QLabel("")
+        preview.setWordWrap(True)
+        preview.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(preview)
+
+        def reparse():
+            p = CommandParser.parse(edit.toPlainText())
+            if p:
+                preview.setText(
+                    f'<span style="color:{GREEN};">✓ 解析成功</span>'
+                    f'<span style="color:#7A8699;"> · 客户端 ID: {p["client_id"]} · 服务器: {p["rpc_url"]}</span>'
+                )
+            elif edit.toPlainText().strip():
+                preview.setText(f'<span style="color:{RED};">未识别到完整参数（需要 -s、-i 和 --rpc-url）</span>')
+            else:
+                preview.setText("")
+        edit.textChanged.connect(reparse)
+        reparse()
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Save).setText("保存并重启")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            params = CommandParser.parse(edit.toPlainText())
+            if not params:
+                return
+            # 停掉当前客户端, 保存新配置, 重启
+            if self.client.running():
+                self.stop_client()
+            self.cfg.data["client"] = params
+            self.cfg.save()
+            self._refresh_config_view()
+            self._append_log(
+                f"[GUI] 配置已修改: 客户端 {params['client_id']} -> {params['rpc_url']}"
+            )
+            self.start_client()
 
     def _on_proc_started(self):
         self.btn_toggle.setText("停止")
