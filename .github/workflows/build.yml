@@ -22,7 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pyinstaller PySide6 pillow
+          pip install pyinstaller PySide6 pillow grpcio
 
       - name: Generate icon (.ico)
         run: |
@@ -33,6 +33,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --windowed `
             --name FRPPanelGUI `
             --icon frp.ico `
+            --collect-all grpc `
             --add-data "docs/icons/frp.png;frp.png" `
             frppanel-gui.py
 

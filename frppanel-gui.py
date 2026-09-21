@@ -52,6 +52,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 CLIENT_EXE = DATA_DIR / "frp-panel-client.exe"
 CLIENT_LOG = DATA_DIR / "client.log"
 CLIENT_LOG_OLD = DATA_DIR / "client.log.old"
+CA_CACHE_FILE = DATA_DIR / "master_ca.pem"
 LOG_ROTATE_SIZE = 1024 * 1024  # 1MB 后轮转
 
 DOWNLOAD_URLS = [
@@ -698,20 +699,277 @@ class ClientProcess(QObject):
             return False
 
 # ----------------------------------------------------------------------------
+# 管理服务器 RPC (gRPC 直连拉取隧道配置, 无需面板账号)
+# ----------------------------------------------------------------------------
+# 链路: POST /api/v1/auth/cert (clientID+secret) 换 master CA 证书
+#       -> gRPC TLS 直连 master.Master/PullClientConfig
+#       -> shadow 机制: 配置在子 client (原ID@N), 递归拉取合并
+# 配置是 frp v1 JSON 格式, protobuf 字段编号来自 frp-panel pb 定义:
+#   PullClientConfigReq{255: base};  ClientBase{1: clientId, 2: clientSecret}
+#   PullClientConfigResp{1: status, 2: client};  Client{3: config, 8: clientIds}
+
+def _pb_varint(n: int) -> bytes:
+    out = b""
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out += bytes([b | 0x80])
+        else:
+            out += bytes([b])
+            return out
+
+
+def _pb_enc_msg(field: int, data: bytes) -> bytes:
+    return _pb_varint((field << 3) | 2) + _pb_varint(len(data)) + data
+
+
+def _pb_dec_varint(data: bytes, i: int):
+    r = 0
+    s = 0
+    while True:
+        b = data[i]
+        i += 1
+        r |= (b & 0x7F) << s
+        if not (b & 0x80):
+            return r, i
+        s += 7
+
+
+def _pb_dec_msg(data: bytes) -> dict:
+    """protobuf wire bytes -> {field_num: [values]}"""
+    out = {}
+    i = 0
+    n = len(data)
+    while i < n:
+        tag, i = _pb_dec_varint(data, i)
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            v, i = _pb_dec_varint(data, i)
+        elif wire == 2:
+            ln, i = _pb_dec_varint(data, i)
+            v = data[i:i + ln]
+            i += ln
+        elif wire == 5:
+            v = data[i:i + 4]
+            i += 4
+        elif wire == 1:
+            v = data[i:i + 8]
+            i += 8
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire}")
+        out.setdefault(field, []).append(v)
+    return out
+
+
+def _rpc_fetch_ca(api_base: str, client_id: str, secret: str) -> str:
+    """用客户端凭据换取 master CA 证书 PEM"""
+    url = api_base.rstrip("/") + "/api/v1/auth/cert"
+    body = json.dumps({"clientId": client_id, "clientSecret": secret,
+                       "clientType": 1}).encode()
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    # gin 统一响应: {code, msg, body:{status, cert}}
+    inner = data.get("body") if isinstance(data.get("body"), dict) else data
+    cert = inner.get("cert") or data.get("cert") or ""
+    if not cert:
+        raise RuntimeError("cert 接口未返回证书")
+    if "BEGIN CERTIFICATE" not in cert:
+        cert = base64.b64decode(cert).decode("ascii", errors="replace")
+    if "BEGIN CERTIFICATE" not in cert:
+        raise RuntimeError("cert 接口返回内容无法识别")
+    return cert
+
+
+def _rpc_grpc_pull(host_port: str, ca_pem: str, client_id: str, secret: str) -> bytes:
+    """gRPC 直连 master 调 PullClientConfig, 返回原始响应 bytes"""
+    import grpc  # 延迟导入: 源码运行时缺少则给出友好提示
+    creds = grpc.ssl_channel_credentials(root_certificates=ca_pem.encode())
+    # frp-panel 默认证书签给 127.0.0.1(SAN), 客户端官方实现同样跳过主机名校验,
+    # 这里用 SAN 值做 override 保住证书链校验
+    req = _pb_enc_msg(255, _pb_enc_msg(1, client_id.encode()) + _pb_enc_msg(2, secret.encode()))
+    last = None
+    for override in ("127.0.0.1", None):
+        opts = [("grpc.ssl_target_name_override", override)] if override else []
+        ch = grpc.secure_channel(host_port, creds, options=opts)
+        try:
+            stub = ch.unary_unary("/master.Master/PullClientConfig")
+            return stub(req, timeout=15)
+        except Exception as e:
+            last = e
+        finally:
+            ch.close()
+    raise last
+
+
+def _rpc_parse_client(resp: bytes) -> dict:
+    """解析 PullClientConfigResp 里的 Client 消息"""
+    fields = _pb_dec_msg(resp)
+    client = {}
+    if 2 in fields:
+        cl = _pb_dec_msg(fields[2][0])
+        if 3 in cl:
+            client["config"] = cl[3][0].decode("utf-8", errors="replace")
+        if 8 in cl:
+            client["clientIds"] = [c.decode("utf-8", errors="replace") for c in cl[8]]
+    return client
+
+
+def _rpc_parse_config(cfg_text: str):
+    """解析 frpc 配置(frp v1 JSON)为 (隧道列表, 用户名); 兼容 TOML 兕底
+    frp 运行时 proxy 全名是 user.name, 需要用户名来对齐日志事件"""
+    try:
+        data = json.loads(cfg_text)
+    except Exception:
+        return _rpc_parse_config_toml(cfg_text), ""
+    user = data.get("user") or ""
+    out = []
+    for p in data.get("proxies") or []:
+        name = p.get("name") or "?"
+        ptype = p.get("type") or "?"
+        lip = p.get("localIP") or "127.0.0.1"
+        lport = p.get("localPort")
+        local = f"{lip}:{lport}" if lport not in (None, "") else str(lip)
+        remote = str(p.get("remotePort") or "")
+        if not remote:
+            doms = p.get("customDomains") or []
+            remote = (doms[0] if doms else "") or p.get("subdomain") or ""
+        if not remote and ptype in ("stcp", "xtcp", "sudp"):
+            remote = "P2P"
+        out.append({"name": name, "type": ptype, "local": local,
+                    "remote": remote or "—"})
+    for v in data.get("visitors") or []:
+        name = v.get("name") or "?"
+        vtype = (v.get("type") or "?") + " 访问端"
+        bind = f"{v.get('bindAddr') or ''}:{v.get('bindPort') or ''}"
+        out.append({"name": name, "type": vtype, "local": bind, "remote": "—"})
+    return out, user
+
+
+def _rpc_parse_config_toml(cfg_text: str) -> list:
+    """TOML 兕底: [[proxies]] 块正则提取"""
+    out = []
+    for blk in re.split(r"(?m)^\s*\[\[proxies\]\]", cfg_text)[1:]:
+        def _m(k, cast=str):
+            m = re.search(rf"(?m)^\s*{k}\s*=\s*['\"]?([^'\"\n#]*)", blk)
+            return cast(m.group(1).strip()) if m else ""
+        name = _m("name")
+        if not name:
+            continue
+        ptype = _m("type") or "?"
+        lip = _m("localIP") or "127.0.0.1"
+        lport = _m("localPort")
+        remote = _m("remotePort")
+        if not remote and ptype in ("stcp", "xtcp", "sudp"):
+            remote = "P2P"
+        out.append({"name": name, "type": ptype,
+                    "local": f"{lip}:{lport}" if lport else lip,
+                    "remote": remote or "—"})
+    return out
+
+
+def master_pull_proxies(params: dict) -> dict:
+    """拉取该客户端在管理服务器上的全部隧道配置(含 shadow 子 client)
+    返回 {proxies: [...], user: str}(frp 运行时 proxy 全名为 user.name)"""
+    secret = params.get("secret", "")
+    client_id = params.get("client_id", "")
+    rpc_url = params.get("rpc_url", "")
+    api_url = params.get("api_url", "")
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/]+)", rpc_url)
+    host_port = (m.group(1) if m else rpc_url).strip()
+    if not secret or not client_id or not host_port:
+        raise RuntimeError("缺少客户端凭据配置")
+    # api-url 未填时从 rpc 主机推导默认端口
+    api_base = api_url or ("http://" + host_port.rsplit(":", 1)[0] + ":9000")
+
+    # CA: 优先缓存, 失败时重新换取
+    ca = None
+    try:
+        if CA_CACHE_FILE.exists():
+            ca = CA_CACHE_FILE.read_text("ascii", errors="replace")
+            if "BEGIN CERTIFICATE" not in ca:
+                ca = None
+    except Exception:
+        ca = None
+    if not ca:
+        ca = _rpc_fetch_ca(api_base, client_id, secret)
+        CA_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CA_CACHE_FILE.write_text(ca, "ascii")
+
+    try:
+        resp = _rpc_grpc_pull(host_port, ca, client_id, secret)
+    except Exception:
+        # 证书可能已更换, 强刷 CA 后重试一次
+        ca = _rpc_fetch_ca(api_base, client_id, secret)
+        CA_CACHE_FILE.write_text(ca, "ascii")
+        resp = _rpc_grpc_pull(host_port, ca, client_id, secret)
+
+    client = _rpc_parse_client(resp)
+    configs = []
+    if client.get("config"):
+        configs.append(client["config"])
+    # shadow 机制: 配置在子 client (原ID@N), 用同样凭据拉取
+    for child_id in client.get("clientIds") or []:
+        try:
+            r2 = _rpc_grpc_pull(host_port, ca, child_id, secret)
+            c2 = _rpc_parse_client(r2)
+            if c2.get("config"):
+                configs.append(c2["config"])
+        except Exception:
+            continue
+
+    proxies = []
+    user = ""
+    for cfg in configs:
+        plist, u = _rpc_parse_config(cfg)
+        proxies.extend(plist)
+        user = user or u
+    # 按 name 去重 (同名以先出现的为准)
+    seen = {}
+    for p in proxies:
+        seen.setdefault(p["name"], p)
+    return {"proxies": list(seen.values()), "user": user}
+
+
+class MasterPoller(QThread):
+    """后台线程执行 master_pull_proxies, 避免网络阻塞 UI"""
+    ok = Signal(dict)
+    err = Signal(str)
+
+    def __init__(self, params: dict, parent=None):
+        super().__init__(parent)
+        self.params = params
+
+    def run(self):
+        try:
+            proxies = master_pull_proxies(self.params)
+            self.ok.emit(proxies)
+        except ImportError as e:
+            self.err.emit(f"隧道同步需要 grpcio 库: {e}")
+        except Exception as e:
+            self.err.emit(str(e))
+
+
+# ----------------------------------------------------------------------------
 # 界面辅助
 # ----------------------------------------------------------------------------
 
 def make_icon(status_color: str = None) -> QIcon:
-    """程序/托盘图标: frp 图标 + 右下角状态色点(仅源码形态外置图标; 打包后内嵌)"""
+    """程序/托盘图标: frp 图标(base64 内嵌) + 右下角状态色点"""
     base = QPixmap(64, 64)
     base.fill(Qt.GlobalColor.transparent)
-    # 尝试加载 frp 原图
-    icon_file = getattr(sys, "_MEIPASS", None) and Path(sys._MEIPASS) / "frp.png" or ICON_FILE
-    if icon_file.exists():
-        src = QPixmap(str(icon_file))
-        if not src.isNull():
+    # 从内嵌 base64 加载 frp 图标, 不依赖外部文件
+    try:
+        from frp_icon import FRP_ICON_B64
+        src = QPixmap()
+        if src.loadFromData(base64.b64decode(FRP_ICON_B64)):
             base = src.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio,
                               Qt.TransformationMode.SmoothTransformation)
+    except Exception:
+        pass
     if base.isNull() or base.size().isEmpty():
         # 回退: 自绘圆点
         base = QPixmap(64, 64)
@@ -909,9 +1167,11 @@ class MainWindow(QMainWindow):
         self.last_error = ""
         self.last_hb = None          # datetime
         self.client_version = ""
-        self.proxies = {}            # name -> {type, local, state}
+        self.proxies = {}            # name -> {type, local, remote, state}
+        self._proxy_user = ""         # frp 运行时 proxy 全名前缀(user.)
         self._first_hide_hint = False
         self.downloader = None
+        self.poller = None           # 隧道配置拉取线程
 
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(make_icon(GRAY))
@@ -949,6 +1209,11 @@ class MainWindow(QMainWindow):
         self.hb_timer = QTimer(self)
         self.hb_timer.setInterval(30000)
         self.hb_timer.timeout.connect(self._check_heartbeat)
+
+        # -- 隧道配置轮询 (连接期间每 60s 从 master 同步一次) ----------------
+        self.rpc_timer = QTimer(self)
+        self.rpc_timer.setInterval(60000)
+        self.rpc_timer.timeout.connect(lambda: self.refresh_proxies_rpc(silent=True))
 
         # -- 托盘 ---------------------------------------------------------------
         self._build_tray()
@@ -1127,21 +1392,22 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(8, 14, 8, 8)
         v.setSpacing(8)
         head = QHBoxLayout()
-        tip = QLabel("隧道在管理面板上配置，此处实时显示运行状态")
+        tip = QLabel("隧道在管理面板上配置，此处实时显示；类型与本地地址自动从管理服务器同步")
         tip.setObjectName("subTitleLabel")
         head.addWidget(tip)
         head.addStretch(1)
         btn = QPushButton("刷新")
-        btn.clicked.connect(lambda: self.restart_client_silent())
+        btn.clicked.connect(lambda: self.refresh_proxies_rpc(silent=False))
         head.addWidget(btn)
         v.addLayout(head)
 
-        self.proxy_table = QTableWidget(0, 4)
-        self.proxy_table.setHorizontalHeaderLabels(["名称", "类型", "本地地址", "状态"])
+        self.proxy_table = QTableWidget(0, 5)
+        self.proxy_table.setHorizontalHeaderLabels(["名称", "类型", "本地地址", "远程端口", "状态"])
         self.proxy_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.proxy_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.proxy_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.proxy_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.proxy_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.proxy_table.verticalHeader().setVisible(False)
         self.proxy_table.setAlternatingRowColors(True)
         self.proxy_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1238,6 +1504,12 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(make_icon(icon_color))
         if prev != st and st == ST_CONNECTED and prev in (ST_STARTING, ST_ERROR):
             self.tray.showMessage(APP_TITLE, "已连接到管理服务器", QSystemTrayIcon.MessageIcon.Information, 3000)
+        # 已连接时开启隧道配置轮询, 其余状态停止
+        if st == ST_CONNECTED:
+            if not self.rpc_timer.isActive():
+                self.rpc_timer.start()
+        else:
+            self.rpc_timer.stop()
 
     def _refresh_config_view(self):
         if not self.cfg.configured:
@@ -1433,24 +1705,16 @@ class MainWindow(QMainWindow):
         t = ev["type"]
         if t == "registered":
             self._set_status(ST_CONNECTED)
+            self.refresh_proxies_rpc(silent=True)
         elif t == "config_empty":
             if self.status != ST_CONNECTED:
                 self._set_status(ST_CONNECTED, "已连接，面板尚未配置隧道")
             else:
                 self.status_sub.setText("已连接 · 面板尚未配置隧道")
-            self.proxies.clear()
-            self._render_proxies()
-        elif t == "config_pulled":
-            # 配置拉取成功, 清空旧隧道列表等 frp 库重新报告
-            self.proxies.clear()
-            self._render_proxies()
-        elif t == "config_update":
-            # master 推送配置更新, TOML 会在后续行中解析
-            pass
-        elif t == "config_refresh":
-            # master 通知刷新, 清空旧列表等重新拉取
-            self.proxies.clear()
-            self._render_proxies()
+            self.refresh_proxies_rpc(silent=True)
+        elif t in ("config_pulled", "config_update", "config_refresh"):
+            # master 侧配置变化或客户端拉取成功 -> 从 master 同步最新隧道信息
+            self.refresh_proxies_rpc(silent=True)
         elif t == "heartbeat":
             self.last_hb = datetime.now()
             self.lbl_hb.setText(self.last_hb.strftime("%H:%M:%S"))
@@ -1458,26 +1722,30 @@ class MainWindow(QMainWindow):
             self.client_version = ev.get("version", "")
             self.lbl_ver.setText(self.client_version)
         elif t == "proxy_new":
-            name = ev["name"]
-            ptype = ev.get("ptype") or "—"
-            lip = ev.get("local_ip") or ""
-            lport = ev.get("local_port") or ""
-            local = f"{lip}:{lport}" if (lip and lport) else "—"
-            self.proxies[name] = {"type": ptype, "local": local, "state": "已注册"}
+            # 日志只可靠提供 name; 类型/地址由 RPC 同步补充
+            name = self._strip_proxy_user(ev["name"])
+            cur = self.proxies.get(name)
+            if cur is None:
+                cur = {"type": "—", "local": "—", "remote": "—", "state": "—"}
+                self.proxies[name] = cur
+            cur["state"] = "已注册"
             self._render_proxies()
         elif t == "proxy_ok":
-            if ev["name"] in self.proxies:
-                self.proxies[ev["name"]]["state"] = "运行中"
-            else:
-                self.proxies[ev["name"]] = {"type": "—", "local": "—", "state": "运行中"}
+            name = self._strip_proxy_user(ev["name"])
+            cur = self.proxies.get(name)
+            if cur is None:
+                cur = {"type": "—", "local": "—", "remote": "—", "state": "—"}
+                self.proxies[name] = cur
+            cur["state"] = "运行中"
             self._render_proxies()
         elif t == "proxy_fail":
-            if ev["name"] in self.proxies:
-                self.proxies[ev["name"]]["state"] = "失败"
-            self._render_proxies()
+            name = self._strip_proxy_user(ev["name"])
+            if name in self.proxies:
+                self.proxies[name]["state"] = "失败"
+                self._render_proxies()
         elif t == "error":
             self.last_error = ev.get("msg", "")
-            # 全文显示(已开启自动换行), 悬停气泡兜底
+            # 全文显示(已开启自动换行), 悬停气泡兕底
             self.lbl_err.setText(self.last_error)
             self.lbl_err.setToolTip(self.last_error)
             if self.status != ST_CONNECTED:
@@ -1491,6 +1759,53 @@ class MainWindow(QMainWindow):
             if self.last_hb and (datetime.now() - self.last_hb).total_seconds() < 30:
                 self._set_status(ST_CONNECTED)
 
+    # ==================== 隧道配置 RPC 同步 ===================================
+
+    def refresh_proxies_rpc(self, silent: bool = False):
+        """从管理服务器拉取隧道配置(后台线程)"""
+        if not self.cfg.configured:
+            return
+        if self.poller and self.poller.isRunning():
+            return
+        if not silent:
+            self._append_log("[GUI] 正在从管理服务器同步隧道配置…")
+        self.poller = MasterPoller(self.cfg.client, self)
+        self.poller.ok.connect(self._on_rpc_ok)
+        self.poller.err.connect(self._on_rpc_err)
+        self.poller.start()
+
+    def _on_rpc_ok(self, payload: dict):
+        """RPC 拉取成功: 配置信息以 master 为准, 运行状态保留日志观测
+        frp 日志里 proxy 全名是 user.name, 记住前缀用于剥比对"""
+        proxies = payload.get("proxies") or []
+        self._proxy_user = payload.get("user") or ""
+        merged = {}
+        for p in proxies:
+            prev = self.proxies.get(p["name"])
+            # 日志事件先于 RPC 到达时 user 前缀未知, 条目以 "user.name" 存在, 归并其状态
+            if prev is None and self._proxy_user:
+                prev = self.proxies.get(f"{self._proxy_user}.{p['name']}")
+            merged[p["name"]] = {
+                "type": p["type"], "local": p["local"], "remote": p["remote"],
+                "state": prev["state"] if prev else "待运行",
+            }
+        self.proxies = merged
+        self._render_proxies()
+        self._append_log(f"[GUI] 已同步隧道配置: {len(proxies)} 条" if proxies
+                         else "[GUI] 管理服务器上暂无该客户端的隧道配置")
+        if proxies and self.status == ST_CONNECTED and "尚未配置" in self.status_sub.text():
+            self.status_sub.setText(STATUS_TEXT[ST_CONNECTED][2])
+
+    def _on_rpc_err(self, msg: str):
+        self._append_log(f"[GUI] 隧道配置同步失败: {msg}")
+
+    def _strip_proxy_user(self, raw_name: str) -> str:
+        """frp 日志里 proxy 全名是 user.name, 剥去前缀与配置中的 name 对齐"""
+        u = self._proxy_user
+        if u and raw_name.startswith(u + "."):
+            return raw_name[len(u) + 1:]
+        return raw_name
+
     # ==================== 界面更新 ============================================
 
     def _render_proxies(self):
@@ -1499,13 +1814,15 @@ class MainWindow(QMainWindow):
         for i, name in enumerate(names):
             p = self.proxies[name]
             self.proxy_table.setItem(i, 0, QTableWidgetItem(name))
-            self.proxy_table.setItem(i, 1, QTableWidgetItem(p["type"]))
-            self.proxy_table.setItem(i, 2, QTableWidgetItem(p["local"]))
-            state_item = QTableWidgetItem(p["state"])
+            self.proxy_table.setItem(i, 1, QTableWidgetItem(p.get("type", "—")))
+            self.proxy_table.setItem(i, 2, QTableWidgetItem(p.get("local", "—")))
+            self.proxy_table.setItem(i, 3, QTableWidgetItem(p.get("remote", "—")))
+            state_item = QTableWidgetItem(p.get("state", "—"))
+            state = p.get("state", "")
             state_item.setForeground(
-                QColor(GREEN if p["state"] == "运行中" else (RED if p["state"] == "失败" else YELLOW))
+                QColor(GREEN if state == "运行中" else (RED if state == "失败" else YELLOW))
             )
-            self.proxy_table.setItem(i, 3, state_item)
+            self.proxy_table.setItem(i, 4, state_item)
         self.proxy_empty.setVisible(len(names) == 0)
         self.proxy_table.setVisible(len(names) > 0)
 

@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '67beba87-15c7-475e-8d79-bbc7f51185eb'
-  PropagateID: '67beba87-15c7-475e-8d79-bbc7f51185eb'
-  ReservedCode1: '074ce139-5902-440a-a5ae-8dd1c1cba19c'
-  ReservedCode2: '074ce139-5902-440a-a5ae-8dd1c1cba19c'
+  ProduceID: '82d3f694-6d37-41b0-b562-d327a8be2d9d'
+  PropagateID: '82d3f694-6d37-41b0-b562-d327a8be2d9d'
+  ReservedCode1: '877d06c7-948f-4f77-8f4a-5b7238a1cb0c'
+  ReservedCode2: '877d06c7-948f-4f77-8f4a-5b7238a1cb0c'
 ---
 
 # FRP Panel GUI
@@ -21,7 +21,7 @@ AIGC:
 
 - **一键配置** — 粘贴面板提供的客户端启动命令（支持完整安装命令或 `frp-panel client ...` 命令）即可完成全部配置
 - **实时状态** — 未配置 / 已停止 / 连接中 / 已连接 / 异常，一目了然；断线自动重连状态提示
-- **隧道服务列表** — 自动同步面板上配置的隧道（名称 / 类型 / 本地地址 / 运行状态），无需打开浏览器
+- **隧道服务列表** — 通过 gRPC 直连管理服务器拉取隧道配置（名称 / 类型 / 本地地址 / 远程端口 / 运行状态），无需面板账号；连接后自动同步并在每次配置更新时刷新
 - **开机自启动** — 注册表方式（HKCU Run），无需管理员权限；自启动时自动最小化到托盘
 - **系统托盘常驻** — 关闭窗口即最小化到托盘；托盘图标右下角圆点颜色实时反映连接状态；双击图标或再次运行程序可唤起主窗口
 - **隐私保护** — 服务器地址默认脱敏显示（点击行尾眼睛图标可查看），客户端密钥在日志中自动脱敏
@@ -46,7 +46,7 @@ AIGC:
 ### 方式二：源码运行
 
 ```bash
-pip install PySide6
+pip install PySide6 grpcio
 python frppanel-gui.py
 ```
 
@@ -67,6 +67,7 @@ python frppanel-gui.py
 | `config.json` | 客户端配置（含密钥，仅保存在本机） |
 | `frp-panel-client.exe` | frp-panel 客户端程序 |
 | `client.log` | 客户端运行日志（已脱敏，超过 1MB 自动轮转） |
+| `master_ca.pem` | 管理服务器 CA 证书缓存（gRPC 拉取隧道配置用） |
 
 ## 从官方安装方式迁移
 
@@ -91,9 +92,9 @@ git push origin v1.0.0
 本地打包：
 
 ```bash
-pip install pyinstaller PySide6 pillow
+pip install pyinstaller PySide6 pillow grpcio
 python -c "from PIL import Image; Image.open('docs/icons/frp.png').save('frp.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
-pyinstaller --noconfirm --onefile --windowed --name FRPPanelGUI --icon frp.ico --add-data "docs/icons/frp.png;frp.png" frppanel-gui.py
+pyinstaller --noconfirm --onefile --windowed --name FRPPanelGUI --icon frp.ico --collect-all grpc --add-data "docs/icons/frp.png;frp.png" frppanel-gui.py
 ```
 
 ## 致谢

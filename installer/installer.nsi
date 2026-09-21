@@ -7,7 +7,7 @@ Unicode True
 
 !define APP_NAME "FRP Panel GUI"
 !define APP_EXE "FRPPanelGUI.exe"
-!define APP_VERSION "1.0.0"
+!define APP_VERSION "1.2.0"
 !define APP_REGKEY "FRPPanelGUI"
 
 Name "${APP_NAME} ${APP_VERSION}"
