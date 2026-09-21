@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build
+build/
+dist/
+*.spec
+frp.ico
+
+# IDE
+.vscode/
+.idea/
+
+# Test artifacts
+.temp/
+*.log
