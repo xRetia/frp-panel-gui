@@ -173,16 +173,22 @@ class CommandParser:
 # 客户端日志解析
 # ----------------------------------------------------------------------------
 
+# frp-panel logrus 日志: 2026-09-21 10:20:29.911 [info] [file.go:line]  msg
 LINE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[(\w+)\]\s+\[([^\]]*)\]\s*(.*)$"
 )
-# frp 内嵌日志: [I] [xxx.go:112] [proxyname] start proxy success
-PROXY_OK_RE = re.compile(r"\[([\w.-]+)\] start proxy success")
-# [I] [p/name] proxy name: [name], type: [tcp], localIP: [127.0.0.1], localPort: [22]
-PROXY_NEW_RE = re.compile(
-    r"\[p/([\w.-]+)\] proxy name: \[([\w.-]+)\], type: \[(\w+)\]"
-    r"(?:, localIP: \[([^\]]*)\], localPort: \[(\d+)\])?"
+# frp 库内嵌日志(stdout): 2026-09-21 12:30:03.947 [I] [file.go:172] [run_id] [proxy] start proxy success
+FRP_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[(\w)\]\s+\[([^\]]*)\]\s*(.*)$"
 )
+# frp 库: [run_id] proxy added: [proxy_name]
+FRP_PROXY_ADDED_RE = re.compile(r"proxy added:\s*\[([\w.-]+)\]")
+# frp 库: [run_id] [proxy_name] start proxy success
+FRP_PROXY_OK_RE = re.compile(r"\[([\w.-]+)\]\s+start proxy success")
+# frp 库: [run_id] [proxy_name] start proxy error: ...
+FRP_PROXY_FAIL_RE = re.compile(r"\[([\w.-]+)\]\s+start proxy error:\s*(.*)")
+# 兼容旧格式
+PROXY_OK_RE = re.compile(r"\[([\w.-]+)\] start proxy success")
 PROXY_FAIL_RE = re.compile(r"\[([\w.-]+)\] (?:start error|start proxy failed|proxy failed)")
 
 
@@ -192,7 +198,11 @@ class LogParser:
     @staticmethod
     def parse(line: str):
         clean = strip_ansi(line).rstrip()
+        # 先试 frp-panel logrus 格式
         m = LINE_RE.match(clean)
+        if not m:
+            # 再试 frp 库 stdout 格式: [I] [file.go:line] msg
+            m = FRP_LINE_RE.match(clean)
         if not m:
             # 无时间戳前缀的行(如多行版本信息块)
             vm = re.search(r"BinVersion:\s*(\S+)", clean)
@@ -202,6 +212,7 @@ class LogParser:
         ts, level, loc, msg = m.groups()
         ev = {"type": "log", "level": level, "msg": msg, "ts": ts}
 
+        # frp-panel 事件
         if "client get server register envent success" in msg:
             ev["type"] = "registered"
         elif "config is empty" in msg and "wait for server init" in msg:
@@ -213,23 +224,23 @@ class LogParser:
             ev.update(type="version", version=v)
         elif "has no workers" in msg:
             ev["type"] = "heartbeat"
+        elif "pull client config success" in msg:
+            ev["type"] = "config_pulled"
         else:
-            pm = PROXY_OK_RE.search(msg)
+            # frp 库代理事件(stdout)
+            pm = FRP_PROXY_ADDED_RE.search(msg)
+            if pm:
+                ev.update(type="proxy_new", name=pm.group(1), ptype="", local_ip="", local_port="")
+                return ev, clean
+            pm = FRP_PROXY_OK_RE.search(msg)
             if pm:
                 ev.update(type="proxy_ok", name=pm.group(1))
                 return ev, clean
-            pm = PROXY_NEW_RE.search(msg)
+            pm = FRP_PROXY_FAIL_RE.search(msg)
             if pm:
-                ev.update(
-                    type="proxy_new", name=pm.group(2), ptype=pm.group(3),
-                    local_ip=pm.group(4) or "", local_port=pm.group(5) or "",
-                )
+                ev.update(type="proxy_fail", name=pm.group(1), error=pm.group(2))
                 return ev, clean
-            pm = PROXY_FAIL_RE.search(msg)
-            if pm:
-                ev.update(type="proxy_fail", name=pm.group(1))
-                return ev, clean
-            if level in ("error", "fatal", "panic"):
+            if level in ("error", "fatal", "panic", "E"):
                 ev["type"] = "error"
         return ev, clean
 
@@ -447,6 +458,8 @@ class ClientProcess(QObject):
         self._log_fh = None
         self._log_size = 0
         self._secret = ""
+        self._restart_count = 0
+        self._last_params = None
 
     # -- 生命周期 ------------------------------------------------------------
 
@@ -469,6 +482,7 @@ class ClientProcess(QObject):
         self._user_stop = False
         self._secret = params.get("secret", "")
         self._buf = ""
+        self.reset_restart_count()
         try:
             self._open_log()
             self.proc = QProcess(self)
@@ -490,6 +504,7 @@ class ClientProcess(QObject):
             self._close_log()
             self.procError.emit(f"启动客户端失败: {e}")
             return
+        self._last_params = params
         self.procStarted.emit()
 
     def stop(self):
@@ -545,6 +560,30 @@ class ClientProcess(QObject):
             self._buf = ""
         self._close_log()
         self.procFinished.emit(int(code))
+        # 崩溃自动重启(非用户主动停止 + 异常退出码)
+        if not self._user_stop and code != 0 and self._last_params:
+            self._restart_count += 1
+            if self._restart_count <= 5:
+                delay = min(self._restart_count * 3, 15)  # 3s, 6s, 9s, 12s, 15s
+                self.logLine.emit(
+                    f"[GUI] 客户端异常退出(码 {code}), {delay} 秒后自动重试 (第 {self._restart_count} 次)…"
+                )
+                QTimer.singleShot(delay * 1000, lambda: self._auto_restart())
+            else:
+                self.logLine.emit("[GUI] 客户端多次重启失败, 已停止自动重试, 请检查日志或手动重启")
+                self._restart_count = 0
+
+    def _auto_restart(self):
+        if self._user_stop:
+            self._restart_count = 0
+            return
+        if self._last_params and not self.running():
+            self.logLine.emit(f"[GUI] 正在自动重启客户端…")
+            self.start(self._last_params)
+
+    def reset_restart_count(self):
+        """用户主动启动时重置重启计数"""
+        self._restart_count = 0
 
     def _on_proc_error(self, err):
         msg = {
@@ -1351,6 +1390,10 @@ class MainWindow(QMainWindow):
                 self.status_sub.setText("已连接 · 面板尚未配置隧道")
             self.proxies.clear()
             self._render_proxies()
+        elif t == "config_pulled":
+            # 配置拉取成功, 清空旧隧道列表等 frp 库重新报告
+            self.proxies.clear()
+            self._render_proxies()
         elif t == "heartbeat":
             self.last_hb = datetime.now()
             self.lbl_hb.setText(self.last_hb.strftime("%H:%M:%S"))
@@ -1359,16 +1402,17 @@ class MainWindow(QMainWindow):
             self.lbl_ver.setText(self.client_version)
         elif t == "proxy_new":
             name = ev["name"]
-            local = f"{ev.get('local_ip') or '127.0.0.1'}:{ev.get('local_port') or '?'}"
-            self.proxies[name] = {
-                "type": ev.get("ptype", "?"), "local": local, "state": "已注册",
-            }
+            ptype = ev.get("ptype") or "—"
+            lip = ev.get("local_ip") or ""
+            lport = ev.get("local_port") or ""
+            local = f"{lip}:{lport}" if (lip and lport) else "—"
+            self.proxies[name] = {"type": ptype, "local": local, "state": "已注册"}
             self._render_proxies()
         elif t == "proxy_ok":
             if ev["name"] in self.proxies:
                 self.proxies[ev["name"]]["state"] = "运行中"
             else:
-                self.proxies[ev["name"]] = {"type": "?", "local": "?", "state": "运行中"}
+                self.proxies[ev["name"]] = {"type": "—", "local": "—", "state": "运行中"}
             self._render_proxies()
         elif t == "proxy_fail":
             if ev["name"] in self.proxies:
