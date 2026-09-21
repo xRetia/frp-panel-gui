@@ -219,6 +219,10 @@ class LogParser:
             ev["type"] = "config_empty"
         elif "EVENT_PING" in msg or "client resp received" in msg:
             ev["type"] = "heartbeat"
+        elif "EVENT_UPDATE_FRPC" in msg:
+            ev["type"] = "config_update"
+        elif "EVENT_START_FRPC" in msg:
+            ev["type"] = "config_refresh"
         elif "BinVersion:" in msg:
             v = msg.split("BinVersion:")[1].strip().split()[0]
             ev.update(type="version", version=v)
@@ -460,6 +464,8 @@ class ClientProcess(QObject):
         self._secret = ""
         self._restart_count = 0
         self._last_params = None
+        self._toml_buf = []
+        self._in_update = False
 
     # -- 生命周期 ------------------------------------------------------------
 
@@ -546,11 +552,55 @@ class ClientProcess(QObject):
 
     def _handle_line(self, line: str):
         ev, clean = LogParser.parse(line)
+
+        # 多行 TOML 配置缓冲: update frpc 日志含 TOML 配置(跨多行)
+        # 首行有时间戳, 后续行是裸 TOML, 直到下一行时间戳出现
+        if self._in_update:
+            if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", clean):
+                # 新的带时间戳行 -> TOML 块结束
+                self._parse_toml_buf()
+                self._in_update = False
+                self._toml_buf = []
+            else:
+                self._toml_buf.append(clean)
+
+        if "update frpc" in clean and "req:" in clean:
+            self._in_update = True
+            self._toml_buf = [clean]
+
         shown = mask_secret(clean, self._secret)
         self._write_log(shown)
         self.logLine.emit(shown)
         if ev and ev["type"] != "raw":
             self.event.emit(ev)
+
+    def _parse_toml_buf(self):
+        """从 update frpc 的多行日志中解析 TOML proxy 配置"""
+        if not self._toml_buf:
+            return
+        text = "\n".join(self._toml_buf)
+        # 匹配 [[proxies]] 块中的 name/type/localIP/localPort
+        proxy_blocks = re.findall(
+            r"\[\[proxies\]\]\s*\n(.*?)(?=\n\[\[|\n\[\s*$|$)",
+            text, re.DOTALL
+        )
+        for block in proxy_blocks:
+            name_m = re.search(r'name\s*=\s*"([^"]+)"', block)
+            type_m = re.search(r'type\s*=\s*"([^"]+)"', block)
+            ip_m = re.search(r'localIP\s*=\s*"([^"]*)"', block)
+            port_m = re.search(r'localPort\s*=\s*(\d+)', block)
+            if name_m:
+                ev = {
+                    "type": "proxy_new",
+                    "name": name_m.group(1),
+                    "ptype": type_m.group(1) if type_m else "",
+                    "local_ip": ip_m.group(1) if ip_m else "",
+                    "local_port": port_m.group(1) if port_m else "",
+                }
+                self.event.emit(ev)
+                self.logLine.emit(
+                    f"[GUI] 解析到隧道: {ev['name']} ({ev['ptype'] or '?'}) -> {ev['local_ip'] or '?'}:{ev['local_port'] or '?'}"
+                )
 
     # -- 进程结束 ------------------------------------------------------------
 
@@ -1392,6 +1442,13 @@ class MainWindow(QMainWindow):
             self._render_proxies()
         elif t == "config_pulled":
             # 配置拉取成功, 清空旧隧道列表等 frp 库重新报告
+            self.proxies.clear()
+            self._render_proxies()
+        elif t == "config_update":
+            # master 推送配置更新, TOML 会在后续行中解析
+            pass
+        elif t == "config_refresh":
+            # master 通知刷新, 清空旧列表等重新拉取
             self.proxies.clear()
             self._render_proxies()
         elif t == "heartbeat":
